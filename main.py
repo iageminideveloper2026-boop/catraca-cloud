@@ -4,7 +4,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
-app = FastAPI(title="ALIV SaaS - Gestão de Comandas, Cardápio e Catraca")
+app = FastAPI(title="ALIV SaaS - Gestão de Comandas, Pedidos e Catraca")
 
 agentes_conectados = {}
 
@@ -20,35 +20,25 @@ cardapio_db = [
     {"id": 8, "nome": "Refrigerante Lata 350ml", "categoria": "Bebidas", "preco": 7.00}
 ]
 
-# Comandas cadastradas vinculadas ao número visual e ao RFID do cartão
+# Inicialização das comandas ordenadas de 1 a 20
 comandas_db = {}
 for i in range(1, 21):
     comandas_db[str(i)] = {
         "numero": str(i),
-        # Exemplo: RFID pode ser o número com zeros ou o código impresso na etiqueta
         "rfid": f"{i:016d}",
-        "status": "livre",  # "livre" (paga/sem débito) ou "aberta" (consumindo)
+        "status": "livre",  # "livre" (sem débito) ou "aberta" (com consumo)
         "total": 0.0,
         "itens": [],
         "abertura": None
     }
 
-# Atribuindo o RFID de exemplo do manual à comanda 1
-comandas_db["1"]["rfid"] = "00000000000012651543"
-comandas_db["1"]["status"] = "aberta"
-comandas_db["1"]["total"] = 8.80
-comandas_db["1"]["itens"] = ["1x Esfiha de Atum"]
-comandas_db["1"]["abertura"] = "14:10"
-
-comandas_db["2"]["status"] = "aberta"
-comandas_db["2"]["total"] = 11.00
-comandas_db["2"]["itens"] = ["1x Esfiha de Atum c/ Catupiry"]
-comandas_db["2"]["abertura"] = "15:20"
-
-comandas_db["3"]["status"] = "aberta"
-comandas_db["3"]["total"] = 25.85
-comandas_db["3"]["itens"] = ["2x Esfiha de Atum c/ Queijo", "1x Água Mineral"]
-comandas_db["3"]["abertura"] = "14:35"
+# Exemplos pré-carregados seguindo a ordem
+comandas_db["1"] = {"numero": "1", "rfid": "00000000000012651543", "status": "aberta", "total": 8.80, "itens": [{"nome": "Esfiha de Atum", "qtd": 1, "preco": 8.80}], "abertura": "14:10"}
+comandas_db["2"] = {"numero": "2", "rfid": "0000000000000002", "status": "aberta", "total": 11.00, "itens": [{"nome": "Esfiha de Atum c/ Catupiry", "qtd": 1, "preco": 11.00}], "abertura": "15:20"}
+comandas_db["3"] = {"numero": "3", "rfid": "0000000000000003", "status": "aberta", "total": 25.85, "itens": [{"nome": "Esfiha de Atum c/ Queijo", "qtd": 2, "preco": 12.00}, {"nome": "Água Mineral", "qtd": 1, "preco": 1.85}], "abertura": "14:35"}
+comandas_db["4"] = {"numero": "4", "rfid": "0000000000000004", "status": "aberta", "total": 7.70, "itens": [{"nome": "Esfiha de Bauru", "qtd": 1, "preco": 7.70}], "abertura": "15:00"}
+comandas_db["5"] = {"numero": "5", "rfid": "0000000000000005", "status": "aberta", "total": 68.74, "itens": [{"nome": "Pizza Grande (8 Fatias)", "qtd": 1, "preco": 55.00}, {"nome": "Água Mineral 510ml c/ Gás", "qtd": 2, "preco": 6.87}], "abertura": "13:40"}
+comandas_db["6"] = {"numero": "6", "rfid": "0000000000000006", "status": "aberta", "total": 8.80, "itens": [{"nome": "Esfiha de Atum", "qtd": 1, "preco": 8.80}], "abertura": "15:15"}
 
 historico_passagens = []
 
@@ -57,9 +47,13 @@ class ProdutoItem(BaseModel):
     categoria: str
     preco: float
 
-class LancamentoItem(BaseModel):
+class ItemPedido(BaseModel):
     produto_id: int
-    quantidade: int = 1
+    quantidade: int
+
+class CriarPedidoPayload(BaseModel):
+    comanda: str
+    itens: list[ItemPedido]
 
 class RfidVinculo(BaseModel):
     rfid: str
@@ -71,7 +65,7 @@ def painel_principal():
     <html lang="pt-BR">
     <head>
         <meta charset="UTF-8">
-        <title>ALIV SaaS - Controle de Comandas & Catraca</title>
+        <title>ALIV SaaS - Central de Pedidos & Comandas</title>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <style>
             :root {
@@ -84,6 +78,7 @@ def painel_principal():
                 --primary: #3b82f6;
                 --success: #10b981;
                 --danger: #ef4444;
+                --warning: #f59e0b;
                 --text-main: #f3f4f6;
                 --text-muted: #9ca3af;
             }
@@ -99,8 +94,9 @@ def painel_principal():
             .top-bar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
             .badge-beta { background: #374151; font-size: 11px; padding: 3px 8px; border-radius: 4px; color: #60a5fa; font-weight: bold; }
 
-            .btn { border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 600; }
+            .btn { border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 600; transition: 0.15s; }
             .btn-primary { background: var(--primary); color: white; }
+            .btn-primary:hover { background: #2563eb; }
             .btn-success { background: var(--success); color: white; }
             .btn-danger { background: var(--danger); color: white; }
             .btn-sm { padding: 4px 8px; font-size: 11px; }
@@ -109,21 +105,24 @@ def painel_principal():
             .tab-content { display: none; }
             .tab-content.active { display: block; }
 
-            .cards-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 16px; margin-top: 15px; }
-            .card-comanda { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 12px; padding: 16px; display: flex; flex-direction: column; justify-content: space-between; min-height: 145px; cursor: pointer; transition: 0.15s; }
+            /* Grid em Cartões */
+            .cards-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(215px, 1fr)); gap: 16px; margin-top: 15px; }
+            .card-comanda { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 12px; padding: 16px; display: flex; flex-direction: column; justify-content: space-between; min-height: 150px; cursor: pointer; transition: 0.15s; }
             .card-comanda:hover { transform: translateY(-2px); border-color: var(--primary); }
             .card-comanda.livre { background: var(--bg-card-livre); border-style: dashed; }
             .card-header-comanda { display: flex; justify-content: space-between; align-items: center; font-size: 12px; font-weight: bold; }
-            .card-valor { font-size: 20px; font-weight: bold; margin: 10px 0 4px 0; color: #fff; }
-            .card-detalhes { font-size: 11px; color: var(--text-muted); line-height: 1.3; max-height: 32px; overflow: hidden; }
+            .card-valor { font-size: 22px; font-weight: bold; margin: 10px 0 4px 0; color: #fff; }
+            .card-detalhes { font-size: 11px; color: var(--text-muted); line-height: 1.4; max-height: 38px; overflow: hidden; text-overflow: ellipsis; }
 
             table { width: 100%; border-collapse: collapse; margin-top: 15px; font-size: 13px; }
             th { text-align: left; padding: 10px; color: var(--text-muted); border-bottom: 1px solid var(--border-color); }
             td { padding: 10px; border-bottom: 1px solid var(--border-color); }
             .card-container { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 10px; padding: 20px; }
 
-            .modal-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.7); display: none; justify-content: center; align-items: center; z-index: 1000; }
-            .modal-box { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 12px; width: 460px; padding: 22px; }
+            /* Modal */
+            .modal-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.75); display: none; justify-content: center; align-items: center; z-index: 1000; }
+            .modal-box { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 12px; width: 500px; padding: 24px; max-height: 90vh; overflow-y: auto; }
+            .item-carrinho { display: flex; justify-content: space-between; align-items: center; background: var(--bg-input); padding: 8px 12px; border-radius: 6px; margin-bottom: 6px; font-size: 12px; }
         </style>
     </head>
     <body>
@@ -135,14 +134,17 @@ def painel_principal():
         </div>
 
         <div class="main">
-            <!-- ABA 1: PEDIDOS -->
+            <!-- ABA 1: PEDIDOS / COMANDAS -->
             <div id="aba-pedidos" class="tab-content active">
                 <div class="top-bar">
                     <div>
                         <h2>Quadro de Comandas</h2>
-                        <p style="color: var(--text-muted); font-size: 13px;">Clique em uma comanda para registrar consumo ou receber o pagamento no caixa.</p>
+                        <p style="color: var(--text-muted); font-size: 13px;">Cada comanda representa um pedido em sua respectiva ordem numérica.</p>
                     </div>
-                    <span id="agente-status-pedidos" style="font-size: 12px; color: #ef4444; font-weight: 600;">● Agente Offline</span>
+                    <div style="display:flex; gap:10px; align-items:center;">
+                        <button class="btn btn-primary" onclick="abrirModalNovoPedido()">+ NOVO PEDIDO</button>
+                        <span id="agente-status-pedidos" style="font-size: 12px; color: #ef4444; font-weight: 600;">● Agente Offline</span>
+                    </div>
                 </div>
                 <div class="cards-grid" id="grid-comandas"></div>
             </div>
@@ -152,7 +154,7 @@ def painel_principal():
                 <div class="top-bar">
                     <div>
                         <h2>Cardápio e Produtos</h2>
-                        <p style="color: var(--text-muted); font-size: 13px;">Itens disponíveis para lançamento nas comandas.</p>
+                        <p style="color: var(--text-muted); font-size: 13px;">Produtos cadastrados para inclusão nos pedidos.</p>
                     </div>
                     <button class="btn btn-primary" onclick="abrirModalProduto()">+ Novo Produto</button>
                 </div>
@@ -177,7 +179,7 @@ def painel_principal():
                 <div class="top-bar">
                     <div>
                         <h2>Catraca EVO <span class="badge-beta">BETA</span></h2>
-                        <p style="color: var(--text-muted); font-size: 13px;">Acesso liberado no cofre apenas com saldo zerado / conta paga no caixa.</p>
+                        <p style="color: var(--text-muted); font-size: 13px;">Acesso liberado no cofre apenas com saldo zerado / comanda paga no caixa.</p>
                     </div>
                     <span id="agente-status" style="font-size: 12px; color: #ef4444; font-weight: 600;">● Agente Offline</span>
                 </div>
@@ -205,7 +207,46 @@ def painel_principal():
             </div>
         </div>
 
-        <!-- MODAL: DETALHES DA COMANDA / CAIXA -->
+        <!-- MODAL 1: CRIAR NOVO PEDIDO (TELA DE CRIAR PEDIDO) -->
+        <div id="modal-novo-pedido" class="modal-overlay">
+            <div class="modal-box">
+                <h3 style="margin-bottom: 6px;">Novo Pedido</h3>
+                <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 16px;">Selecione o número da comanda na ordem e adicione os itens.</p>
+                
+                <div style="margin-bottom: 14px;">
+                    <label style="font-size: 12px; color: var(--text-muted);">Número da Comanda (1 a 20):</label>
+                    <select id="novo-pedido-comanda" style="width: 100%; margin-top: 4px;"></select>
+                </div>
+
+                <div style="margin-bottom: 14px;">
+                    <label style="font-size: 12px; color: var(--text-muted);">Adicionar Produto:</label>
+                    <div style="display: flex; gap: 8px; margin-top: 4px;">
+                        <select id="novo-pedido-produto" style="flex: 2;"></select>
+                        <input type="number" id="novo-pedido-qtd" value="1" min="1" style="width: 70px;">
+                        <button class="btn btn-primary" onclick="adicionarItemCarrinho()">+ Adicionar</button>
+                    </div>
+                </div>
+
+                <div style="margin-bottom: 16px;">
+                    <label style="font-size: 12px; color: var(--text-muted); margin-bottom: 4px; display:block;">Itens do Pedido:</label>
+                    <div id="carrinho-itens" style="max-height: 140px; overflow-y: auto; border: 1px solid var(--border-color); border-radius: 6px; padding: 8px;">
+                        <p style="color: var(--text-muted); font-size: 12px; text-align: center;">Nenhum produto adicionado.</p>
+                    </div>
+                </div>
+
+                <div style="display:flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+                    <span style="font-size: 14px;">Total do Pedido:</span>
+                    <strong style="font-size: 20px; color: #10b981;" id="novo-pedido-total">R$ 0,00</strong>
+                </div>
+
+                <div style="display: flex; gap: 10px;">
+                    <button class="btn btn-success" style="flex: 1;" onclick="salvarNovoPedido()">Confirmar e Abrir Pedido</button>
+                    <button class="btn btn-danger" onclick="fecharModais()">Cancelar</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- MODAL 2: DETALHES DA COMANDA / CAIXA -->
         <div id="modal-comanda" class="modal-overlay">
             <div class="modal-box">
                 <h3 id="modal-comanda-titulo">Comanda #--</h3>
@@ -218,9 +259,9 @@ def painel_principal():
                 </div>
 
                 <div style="margin-bottom: 15px;">
-                    <label>Lançar Consumo:</label>
+                    <label style="font-size: 12px; color: var(--text-muted);">Lançar mais consumo:</label>
                     <div style="display: flex; gap: 8px; margin-top: 4px;">
-                        <select id="select-produtos" style="flex: 1;"></select>
+                        <select id="select-produtos-comanda" style="flex: 1;"></select>
                         <button class="btn btn-primary" onclick="lancarProdutoComanda()">Lançar</button>
                     </div>
                 </div>
@@ -239,20 +280,20 @@ def painel_principal():
             </div>
         </div>
 
-        <!-- MODAL: NOVO PRODUTO -->
+        <!-- MODAL 3: NOVO PRODUTO -->
         <div id="modal-produto" class="modal-overlay">
             <div class="modal-box">
                 <h3 style="margin-bottom: 15px;">Cadastrar Produto</h3>
                 <div style="margin-bottom: 10px;">
-                    <label>Nome:</label>
+                    <label style="font-size: 12px; color: var(--text-muted);">Nome:</label>
                     <input type="text" id="prod-nome" placeholder="Ex: Porção de Batata">
                 </div>
                 <div style="margin-bottom: 10px;">
-                    <label>Categoria:</label>
+                    <label style="font-size: 12px; color: var(--text-muted);">Categoria:</label>
                     <input type="text" id="prod-categoria" placeholder="Ex: Porções, Bebidas">
                 </div>
                 <div style="margin-bottom: 15px;">
-                    <label>Preço (R$):</label>
+                    <label style="font-size: 12px; color: var(--text-muted);">Preço (R$):</label>
                     <input type="number" step="0.01" id="prod-preco" placeholder="0.00">
                 </div>
                 <div style="display: flex; gap: 10px;">
@@ -264,6 +305,8 @@ def painel_principal():
 
         <script>
             let comandaSelecionada = null;
+            let produtosDisponiveis = [];
+            let itensCarrinho = [];
 
             function trocarAba(evt, aba) {
                 document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
@@ -286,23 +329,30 @@ def painel_principal():
                     document.getElementById("agente-status-pedidos").innerText = statusTexto;
                     document.getElementById("agente-status-pedidos").style.color = statusCor;
 
+                    // Ordena as comandas numericamente (1, 2, 3...)
                     const grid = document.getElementById("grid-comandas");
                     grid.innerHTML = "";
 
-                    for (const [id, c] of Object.entries(dados.comandas)) {
+                    const comandasOrdenadas = Object.keys(dados.comandas)
+                        .sort((a, b) => parseInt(a) - parseInt(b))
+                        .map(key => dados.comandas[key]);
+
+                    for (const c of comandasOrdenadas) {
                         const div = document.createElement("div");
                         const isLivre = c.status === "livre";
                         div.className = `card-comanda ${isLivre ? 'livre' : ''}`;
-                        div.onclick = () => abrirModalComanda(id);
+                        div.onclick = () => abrirModalComanda(c.numero);
+
+                        const resumoItens = c.itens.map(i => `${i.qtd}x ${i.nome}`).join(', ');
 
                         div.innerHTML = `
                             <div>
                                 <div class="card-header-comanda">
-                                    <span>COMANDA ${id}</span>
-                                    <span style="color: ${isLivre ? '#9ca3af' : '#10b981'}">${isLivre ? 'LIVRE / PAGA' : (c.abertura || 'Ativa')}</span>
+                                    <span>COMANDA ${c.numero}</span>
+                                    <span style="color: ${isLivre ? '#9ca3af' : '#10b981'}">${isLivre ? 'LIVRE' : (c.abertura || 'Ativa')}</span>
                                 </div>
                                 <div class="card-valor">${isLivre ? 'Livre' : `R$ ${c.total.toFixed(2)}`}</div>
-                                <div class="card-detalhes">${isLivre ? 'Comanda paga ou sem débito' : c.itens.join(', ')}</div>
+                                <div class="card-detalhes">${isLivre ? 'Comanda paga ou sem débito' : resumoItens}</div>
                             </div>
                             <div style="margin-top: 10px; font-size: 11px; display:flex; justify-content:space-between; align-items:center;">
                                 <span style="color: ${isLivre ? '#34d399' : '#f87171'}; font-weight: bold;">
@@ -314,6 +364,7 @@ def painel_principal():
                         grid.appendChild(div);
                     }
 
+                    // Renderiza Passagens
                     const logsDiv = document.getElementById("lista-passagens");
                     if (dados.passagens.length > 0) {
                         logsDiv.innerHTML = dados.passagens.map(p => `
@@ -331,11 +382,11 @@ def painel_principal():
 
             async function carregarCardapio() {
                 const resp = await fetch('/api/cardapio');
-                const prods = await resp.json();
+                produtosDisponiveis = await resp.json();
 
                 const tbody = document.getElementById("tabela-produtos");
                 tbody.innerHTML = "";
-                prods.forEach(p => {
+                produtosDisponiveis.forEach(p => {
                     tbody.innerHTML += `
                         <tr>
                             <td>#${p.id}</td>
@@ -347,10 +398,93 @@ def painel_principal():
                     `;
                 });
 
-                const sel = document.getElementById("select-produtos");
-                sel.innerHTML = prods.map(p => `<option value="${p.id}">${p.nome} - R$ ${p.preco.toFixed(2)}</option>`).join('');
+                // Atualiza selects nos modais
+                const options = produtosDisponiveis.map(p => `<option value="${p.id}">${p.nome} - R$ ${p.preco.toFixed(2)}</option>`).join('');
+                document.getElementById("select-produtos-comanda").innerHTML = options;
+                document.getElementById("novo-pedido-produto").innerHTML = options;
             }
 
+            /* --- CRIAÇÃO DE NOVO PEDIDO --- */
+            async function abrirModalNovoPedido() {
+                itensCarrinho = [];
+                atualizarCarrinhoVisual();
+
+                // Carrega comandas no select respeitando a ordem de 1 a 20
+                const resp = await fetch('/api/status/loja_beta');
+                const dados = await resp.json();
+                const sel = document.getElementById("novo-pedido-comanda");
+                sel.innerHTML = "";
+
+                Object.keys(dados.comandas)
+                    .sort((a, b) => parseInt(a) - parseInt(b))
+                    .forEach(num => {
+                        const c = dados.comandas[num];
+                        sel.innerHTML += `<option value="${num}">Comanda ${num.padStart(2, '0')} - [${c.status === 'livre' ? 'LIVRE' : 'EM USO - R$ ' + c.total.toFixed(2)}]</option>`;
+                    });
+
+                document.getElementById("modal-novo-pedido").style.display = "flex";
+            }
+
+            function adicionarItemCarrinho() {
+                const prodId = parseInt(document.getElementById("novo-pedido-produto").value);
+                const qtd = parseInt(document.getElementById("novo-pedido-qtd").value) || 1;
+                const prod = produtosDisponiveis.find(p => p.id === prodId);
+
+                if (!prod) return;
+
+                itensCarrinho.push({ produto_id: prod.id, nome: prod.nome, quantidade: qtd, preco: prod.preco });
+                atualizarCarrinhoVisual();
+            }
+
+            function removerItemCarrinho(index) {
+                itensCarrinho.splice(index, 1);
+                atualizarCarrinhoVisual();
+            }
+
+            function atualizarCarrinhoVisual() {
+                const container = document.getElementById("carrinho-itens");
+                let total = 0;
+
+                if (itensCarrinho.length === 0) {
+                    container.innerHTML = `<p style="color: var(--text-muted); font-size: 12px; text-align: center;">Nenhum produto adicionado.</p>`;
+                } else {
+                    container.innerHTML = itensCarrinho.map((item, idx) => {
+                        const subtotal = item.preco * item.quantidade;
+                        total += subtotal;
+                        return `
+                            <div class="item-carrinho">
+                                <span>${item.quantidade}x <strong>${item.nome}</strong> (R$ ${subtotal.toFixed(2)})</span>
+                                <button class="btn btn-sm btn-danger" onclick="removerItemCarrinho(${idx})">✕</button>
+                            </div>
+                        `;
+                    }).join('');
+                }
+
+                document.getElementById("novo-pedido-total").innerText = `R$ ${total.toFixed(2)}`;
+            }
+
+            async function salvarNovoPedido() {
+                if (itensCarrinho.length === 0) {
+                    return alert("Adicione ao menos um produto antes de confirmar o pedido.");
+                }
+
+                const comanda = document.getElementById("novo-pedido-comanda").value;
+                const payload = {
+                    comanda: comanda,
+                    itens: itensCarrinho.map(i => ({ produto_id: i.produto_id, quantidade: i.quantidade }))
+                };
+
+                await fetch('/api/pedidos/criar', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(payload)
+                });
+
+                fecharModais();
+                carregarDados();
+            }
+
+            /* --- MODAL DA COMANDA / CAIXA --- */
             async function abrirModalComanda(id) {
                 comandaSelecionada = id;
                 const resp = await fetch(`/api/comanda/${id}`);
@@ -362,7 +496,7 @@ def painel_principal():
 
                 const itensDiv = document.getElementById("modal-comanda-itens");
                 itensDiv.innerHTML = c.itens.length > 0 
-                    ? c.itens.map(i => `<p style="font-size:12px; margin: 3px 0;">• ${i}</p>`).join('')
+                    ? c.itens.map(i => `<p style="font-size:12px; margin: 3px 0;">• ${i.qtd}x <strong>${i.nome}</strong> - R$ ${(i.preco * i.qtd).toFixed(2)}</p>`).join('')
                     : `<p style="font-size:12px; color:var(--text-muted);">Nenhum item consumido no momento.</p>`;
 
                 document.getElementById("modal-comanda").style.display = "flex";
@@ -375,16 +509,16 @@ def painel_principal():
                     headers: {"Content-Type": "application/json"},
                     body: JSON.stringify({ rfid: novoRfid })
                 });
-                alert("RFID vinculado à comanda com sucesso!");
+                alert("RFID vinculado com sucesso!");
                 carregarDados();
             }
 
             async function lancarProdutoComanda() {
-                const prodId = document.getElementById("select-produtos").value;
+                const prodId = parseInt(document.getElementById("select-produtos-comanda").value);
                 await fetch(`/api/comanda/${comandaSelecionada}/lancar`, {
                     method: "POST",
                     headers: {"Content-Type": "application/json"},
-                    body: JSON.stringify({ produto_id: parseInt(prodId), quantidade: 1 })
+                    body: JSON.stringify({ produto_id: prodId, quantidade: 1 })
                 });
                 abrirModalComanda(comandaSelecionada);
                 carregarDados();
@@ -466,8 +600,26 @@ def excluir_produto(produto_id: int):
     return {"status": "ok"}
 
 # ==========================================
-# ENDPOINTS REST: COMANDAS & PEDIDOS
+# ENDPOINTS REST: CRIAÇÃO DE PEDIDOS & COMANDAS
 # ==========================================
+@app.post("/api/pedidos/criar")
+def criar_pedido(dados: CriarPedidoPayload):
+    if dados.comanda not in comandas_db:
+        raise HTTPException(status_code=404, detail="Comanda não encontrada")
+
+    c = comandas_db[dados.comanda]
+    for item in dados.itens:
+        prod = next((p for p in cardapio_db if p["id"] == item.produto_id), None)
+        if prod:
+            c["itens"].append({"nome": prod["nome"], "qtd": item.quantidade, "preco": prod["preco"]})
+            c["total"] += (prod["preco"] * item.quantidade)
+
+    c["status"] = "aberta"
+    if not c["abertura"]:
+        c["abertura"] = time.strftime("%H:%M")
+
+    return {"status": "ok", "comanda": c}
+
 @app.get("/api/comanda/{comanda_id}")
 def obter_comanda(comanda_id: str):
     if comanda_id in comandas_db:
@@ -482,18 +634,19 @@ def vincular_rfid(comanda_id: str, dados: RfidVinculo):
     raise HTTPException(status_code=404, detail="Comanda não encontrada")
 
 @app.post("/api/comanda/{comanda_id}/lancar")
-def lancar_item(comanda_id: str, dados: LancamentoItem):
+def lancar_item_direto(comanda_id: str, dados: dict):
     if comanda_id not in comandas_db:
         raise HTTPException(status_code=404, detail="Comanda não encontrada")
 
-    produto = next((p for p in cardapio_db if p["id"] == dados.produto_id), None)
+    produto = next((p for p in cardapio_db if p["id"] == dados.get("produto_id")), None)
     if not produto:
         raise HTTPException(status_code=404, detail="Produto não encontrado")
 
+    qtd = dados.get("quantidade", 1)
     c = comandas_db[comanda_id]
     c["status"] = "aberta"
-    c["total"] += (produto["preco"] * dados.quantidade)
-    c["itens"].append(f"{dados.quantidade}x {produto['nome']}")
+    c["total"] += (produto["preco"] * qtd)
+    c["itens"].append({"nome": produto["nome"], "qtd": qtd, "preco": produto["preco"]})
     if not c["abertura"]:
         c["abertura"] = time.strftime("%H:%M")
     return c
@@ -535,17 +688,15 @@ async def websocket_endpoint(websocket: WebSocket, slug: str, agent_id: str = ""
             if dados.get("evento") == "VALIDAR_COMANDA":
                 rfid_lido = str(dados.get("comanda", "")).strip()
 
-                # Busca qual comanda possui este RFID vinculado ou se foi lido o número direto
                 comanda_encontrada = None
                 for c in comandas_db.values():
-                    # Compara com o RFID completo ou sem zeros à esquerda
                     if c["rfid"] == rfid_lido or c["rfid"].lstrip("0") == rfid_lido.lstrip("0") or c["numero"] == rfid_lido:
                         comanda_encontrada = c
                         break
 
                 hora_str = time.strftime("%H:%M:%S")
 
-                # REGRA 1: Comanda em débito (Não Paga)
+                # Comanda com consumo em aberto -> Bloqueia
                 if comanda_encontrada and comanda_encontrada["status"] == "aberta" and comanda_encontrada["total"] > 0:
                     liberado = False
                     resposta_txt = "Acesso Negado Valide no Caixa"
@@ -555,8 +706,7 @@ async def websocket_endpoint(websocket: WebSocket, slug: str, agent_id: str = ""
                         "resultado": f"⛔ BLOQUEADO (Débito: R$ {comanda_encontrada['total']:.2f})",
                         "hora": hora_str
                     })
-
-                # REGRA 2: Comanda Quitada / Sem débito
+                # Comanda Paga / Livre -> Libera
                 else:
                     liberado = True
                     resposta_txt = "Acesso liberado Volte Sempre"
@@ -568,7 +718,6 @@ async def websocket_endpoint(websocket: WebSocket, slug: str, agent_id: str = ""
                         "hora": hora_str
                     })
 
-                # Devolve ordem ao agente para emitir o comando REON exato
                 await websocket.send_text(json.dumps({
                     "tipo": "RESPOSTA_COMANDA",
                     "liberado": liberado,
